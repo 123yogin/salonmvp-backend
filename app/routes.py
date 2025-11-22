@@ -328,11 +328,12 @@ def add_service_log():
 def get_today_logs():
     """Get today's service logs"""
     salon_id = session['salon_id']
-    today = date.today()
+    # Use UTC date to match how logs are stored (datetime.utcnow())
+    today_utc = datetime.utcnow().date()
     
     logs = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
-        func.date(ServiceLog.served_at) == today
+        func.date(ServiceLog.served_at) == today_utc
     ).order_by(ServiceLog.served_at.desc()).all()
     
     return jsonify({
@@ -383,36 +384,43 @@ def get_logs():
 @main.route('/api/summary/today', methods=['GET'])
 @login_required
 def get_today_summary():
-    """Get today's revenue summary"""
+    """Get today's revenue summary - automatically resets each day at midnight UTC"""
     salon_id = session['salon_id']
-    today = date.today()
+    # Use UTC date to match how logs are stored (datetime.utcnow())
+    # This date is recalculated on each API call, so it automatically changes each day
+    today_utc = datetime.utcnow().date()
     
-    # Get all logs for today
+    # Get all logs for today only (using UTC date to match stored datetime)
+    # This filter ensures only today's entries are shown, and it resets automatically each day
     logs = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
-        func.date(ServiceLog.served_at) == today
+        func.date(ServiceLog.served_at) == today_utc
     ).all()
     
+    # Calculate totals with proper type conversion
     total_revenue = sum(float(log.price) for log in logs)
-    cash_total = sum(float(log.price) for log in logs if log.payment_method == 'cash')
-    upi_total = sum(float(log.price) for log in logs if log.payment_method == 'upi')
+    cash_total = sum(float(log.price) for log in logs if log.payment_method and log.payment_method.lower() == 'cash')
+    upi_total = sum(float(log.price) for log in logs if log.payment_method and log.payment_method.lower() == 'upi')
     
     return jsonify({
-        'date': today.isoformat(),
-        'total_revenue': total_revenue,
-        'cash_total': cash_total,
-        'upi_total': upi_total,
+        'date': today_utc.isoformat(),  # Returns the date being queried
+        'total_revenue': round(total_revenue, 2),
+        'cash_total': round(cash_total, 2),
+        'upi_total': round(upi_total, 2),
         'transaction_count': len(logs)
     }), 200
 
 @main.route('/api/summary/breakdown', methods=['GET'])
 @login_required
 def get_service_breakdown():
-    """Get service breakdown for today"""
+    """Get service breakdown for today - automatically resets each day at midnight UTC"""
     salon_id = session['salon_id']
-    today = date.today()
+    # Use UTC date to match how logs are stored (datetime.utcnow())
+    # This date is recalculated on each API call, so it automatically changes each day
+    today_utc = datetime.utcnow().date()
     
-    # Get service breakdown
+    # Get service breakdown - include logs with service_id only
+    # This filter ensures only today's entries are shown, and it resets automatically each day
     breakdown = db.session.query(
         Service.name,
         func.count(ServiceLog.id).label('count'),
@@ -421,14 +429,14 @@ def get_service_breakdown():
         ServiceLog, ServiceLog.service_id == Service.id
     ).filter(
         ServiceLog.salon_id == salon_id,
-        func.date(ServiceLog.served_at) == today
+        func.date(ServiceLog.served_at) == today_utc
     ).group_by(Service.name).all()
     
     return jsonify({
         'breakdown': [{
             'service_name': item[0],
             'count': item[1],
-            'total': float(item[2]) if item[2] else 0
+            'total': round(float(item[2]) if item[2] else 0, 2)
         } for item in breakdown]
     }), 200
 
