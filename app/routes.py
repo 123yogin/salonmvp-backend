@@ -1,4 +1,5 @@
 from flask import Blueprint, jsonify
+from app.models import User, Salon, Staff, Service, ServiceLog, DailyClosing
 
 main = Blueprint('main', __name__)
 
