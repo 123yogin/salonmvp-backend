@@ -11,7 +11,7 @@ def create_app(config_class=Config):
     db.init_app(app)
 
     # Configure CORS to allow credentials
-    CORS(app, supports_credentials=True, origins=['http://localhost:5173'])
+    CORS(app, supports_credentials=True, origins=[app.config['FRONTEND_URL']])
     
     # Initialize session
     Session(app)

@@ -48,9 +48,13 @@ def register():
     
     try:
         # Create user
+        # Convert empty strings to None to avoid UNIQUE constraint issues
+        email = data.get('email', '').strip() or None
+        phone = data.get('phone', '').strip() or None
+        
         user = User(
-            email=data.get('email'),
-            phone=data.get('phone'),
+            email=email,
+            phone=phone,
             password_hash=hash_password(data['password'])
         )
         db.session.add(user)
