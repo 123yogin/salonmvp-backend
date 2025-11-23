@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request, g, current_app
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+import pytz
 from sqlalchemy import func
 from app.models import User, Salon, Staff, Service, ServiceLog, DailyClosing
 from app.extensions import db
@@ -19,6 +20,24 @@ def index():
 @main.route('/health')
 def health():
     return jsonify({"status": "healthy"})
+
+# ============================================
+# Helper Functions
+# ============================================
+
+def get_today_range_utc(salon):
+    """
+    Calculates the start and end datetime in UTC for the current day 
+    in the salon's local timezone.
+    """
+    tz = pytz.timezone(salon.timezone)
+    now_local = datetime.now(tz)
+    today_local = now_local.date()
+    
+    start_local = tz.localize(datetime.combine(today_local, datetime.min.time()))
+    end_local = tz.localize(datetime.combine(today_local, datetime.max.time()))
+    
+    return start_local.astimezone(pytz.utc), end_local.astimezone(pytz.utc)
 
 # ============================================
 # Authentication / User Sync Routes
@@ -450,16 +469,16 @@ def add_service_log():
 @main.route('/api/logs/today', methods=['GET'])
 @login_required
 def get_today_logs():
-    """Get today's service logs"""
+    """Get today's service logs (Timezone Aware)"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
     
     salon_id = g.current_salon.id
-    # Use UTC date to match how logs are stored (datetime.utcnow())
-    today_utc = datetime.utcnow().date()
+    start_utc, end_utc = get_today_range_utc(g.current_salon)
     
     query = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
-        func.date(ServiceLog.served_at) == today_utc
+        ServiceLog.served_at >= start_utc,
+        ServiceLog.served_at <= end_utc
     )
 
     # If Staff, filter by their ID so they only see THEIR logs
@@ -520,17 +539,22 @@ def get_logs():
 @main.route('/api/summary/today', methods=['GET'])
 @login_required
 def get_today_summary():
-    """Get today's revenue summary"""
+    """Get today's revenue summary (Timezone Aware)"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
     
     salon_id = g.current_salon.id
-    today_utc = datetime.utcnow().date()
+    start_utc, end_utc = get_today_range_utc(g.current_salon)
+    
+    # Return local date for display
+    tz = pytz.timezone(g.current_salon.timezone)
+    today_str = datetime.now(tz).date().isoformat()
     
     query = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
-        func.date(ServiceLog.served_at) == today_utc
+        ServiceLog.served_at >= start_utc,
+        ServiceLog.served_at <= end_utc
     )
-
+    
     # If Staff, filter by their ID so they only see THEIR revenue
     if g.current_user.role == 'STAFF':
         staff_record = Staff.query.filter_by(user_id=g.current_user.id).first()
@@ -544,7 +568,7 @@ def get_today_summary():
     upi_total = sum(float(log.price) for log in logs if log.payment_method and log.payment_method.lower() == 'upi')
     
     return jsonify({
-        'date': today_utc.isoformat(),
+        'date': today_str,
         'total_revenue': round(total_revenue, 2),
         'cash_total': round(cash_total, 2),
         'upi_total': round(upi_total, 2),
@@ -554,11 +578,11 @@ def get_today_summary():
 @main.route('/api/summary/breakdown', methods=['GET'])
 @login_required
 def get_service_breakdown():
-    """Get service breakdown for today"""
+    """Get service breakdown for today (Timezone Aware)"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
     
     salon_id = g.current_salon.id
-    today_utc = datetime.utcnow().date()
+    start_utc, end_utc = get_today_range_utc(g.current_salon)
     
     breakdown = db.session.query(
         Service.name,
@@ -568,7 +592,8 @@ def get_service_breakdown():
         ServiceLog, ServiceLog.service_id == Service.id
     ).filter(
         ServiceLog.salon_id == salon_id,
-        func.date(ServiceLog.served_at) == today_utc
+        ServiceLog.served_at >= start_utc,
+        ServiceLog.served_at <= end_utc
     ).group_by(Service.name).all()
     
     return jsonify({
@@ -582,7 +607,7 @@ def get_service_breakdown():
 @main.route('/api/summary/staff-performance', methods=['GET'])
 @login_required
 def get_staff_performance():
-    """Get sales performance by staff for today"""
+    """Get sales performance by staff for today (Timezone Aware)"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
     
     # Only OWNER can see this report
@@ -590,7 +615,7 @@ def get_staff_performance():
          return jsonify({'error': 'Unauthorized'}), 403
          
     salon_id = g.current_salon.id
-    today_utc = datetime.utcnow().date()
+    start_utc, end_utc = get_today_range_utc(g.current_salon)
     
     # Query: Group by staff_id, Sum Price
     # Note: This only includes logs linked to a staff member.
@@ -603,7 +628,8 @@ def get_staff_performance():
         ServiceLog, ServiceLog.staff_id == Staff.id
     ).filter(
         ServiceLog.salon_id == salon_id,
-        func.date(ServiceLog.served_at) == today_utc
+        ServiceLog.served_at >= start_utc,
+        ServiceLog.served_at <= end_utc
     ).group_by(Staff.name).all()
     
     return jsonify({
