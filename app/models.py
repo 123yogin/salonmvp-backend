@@ -9,9 +9,9 @@ class User(db.Model):
     __tablename__ = 'users'
 
     id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
-    phone = db.Column(db.String(20), unique=True)
-    email = db.Column(db.String(255), unique=True)
-    password_hash = db.Column(db.Text, nullable=False)
+    cognito_sub = db.Column(db.String(255), unique=True, nullable=True)
+    phone = db.Column(db.String(20), unique=True, nullable=True)
+    email = db.Column(db.String(255), unique=True, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     salons = db.relationship('Salon', backref='owner', lazy=True)

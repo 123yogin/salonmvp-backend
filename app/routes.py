@@ -1,9 +1,10 @@
-from flask import Blueprint, jsonify, request, session
-from datetime import datetime, date, timedelta
+from flask import Blueprint, jsonify, request, g, current_app
+from datetime import datetime, date
 from sqlalchemy import func
 from app.models import User, Salon, Staff, Service, ServiceLog, DailyClosing
 from app.extensions import db
-from app.auth import hash_password, verify_password, login_required
+from app.auth import login_required
+from app.utils_cognito import cognito_client, get_secret_hash
 
 main = Blueprint('main', __name__)
 
@@ -20,147 +21,221 @@ def health():
     return jsonify({"status": "healthy"})
 
 # ============================================
-# Authentication Routes
+# Authentication / User Sync Routes
 # ============================================
 
-@main.route('/api/auth/register', methods=['POST'])
-def register():
-    """Register a new user and create a default salon"""
+@main.route('/api/auth/cognito-login', methods=['POST'])
+def cognito_login():
+    """
+    Proxies login request to Cognito, handling SECRET_HASH.
+    """
     data = request.get_json()
-    
-    # Validate input
-    if not data.get('password'):
-        return jsonify({'error': 'Password is required'}), 400
-    
-    if not data.get('email') and not data.get('phone'):
-        return jsonify({'error': 'Email or phone is required'}), 400
-    
-    # Check if user already exists
-    if data.get('email'):
-        existing_user = User.query.filter_by(email=data['email']).first()
-        if existing_user:
-            return jsonify({'error': 'Email already registered'}), 400
-    
-    if data.get('phone'):
-        existing_user = User.query.filter_by(phone=data['phone']).first()
-        if existing_user:
-            return jsonify({'error': 'Phone already registered'}), 400
+    email = data.get('email')
+    password = data.get('password')
+
+    if not email or not password:
+        return jsonify({'error': 'Email and password are required'}), 400
+
+    client = cognito_client()
+    client_id = current_app.config.get('COGNITO_APP_CLIENT_ID')
     
     try:
-        # Create user
-        # Convert empty strings to None to avoid UNIQUE constraint issues
-        email = data.get('email', '').strip() or None
-        phone = data.get('phone', '').strip() or None
+        print(f"Attempting login for: {email}")
+        secret_hash = get_secret_hash(email)
         
-        user = User(
-            email=email,
-            phone=phone,
-            password_hash=hash_password(data['password'])
-        )
-        db.session.add(user)
-        db.session.flush()  # Get user ID
+        params = {
+            'ClientId': client_id,
+            'AuthFlow': 'USER_PASSWORD_AUTH',
+            'AuthParameters': {
+                'USERNAME': email,
+                'PASSWORD': password,
+            }
+        }
         
-        # Create default salon
-        salon = Salon(
-            owner_id=user.id,
-            name=data.get('salon_name', 'My Salon'),
-            address=data.get('address', ''),
-            timezone=data.get('timezone', 'Asia/Kolkata')
-        )
-        db.session.add(salon)
-        db.session.commit()
+        if secret_hash:
+            params['AuthParameters']['SECRET_HASH'] = secret_hash
+            
+        print("Calling Cognito initiate_auth...")
+        response = client.initiate_auth(**params)
+        print("Cognito response received.")
         
-        # Log user in
-        session['user_id'] = user.id
-        session['salon_id'] = salon.id
+        # Extract tokens
+        auth_result = response.get('AuthenticationResult', {})
+        return jsonify({
+            'accessToken': auth_result.get('AccessToken'),
+            'idToken': auth_result.get('IdToken'),
+            'refreshToken': auth_result.get('RefreshToken'),
+            'expiresIn': auth_result.get('ExpiresIn'),
+            'tokenType': auth_result.get('TokenType')
+        }), 200
+        
+    except client.exceptions.NotAuthorizedException:
+        return jsonify({'error': 'Incorrect username or password'}), 401
+    except client.exceptions.UserNotConfirmedException:
+        return jsonify({'error': 'User is not confirmed'}), 403
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+@main.route('/api/auth/cognito-register', methods=['POST'])
+def cognito_register():
+    """
+    Proxies registration request to Cognito, handling SECRET_HASH.
+    """
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+    phone = data.get('phone')
+
+    if not email or not password:
+        return jsonify({'error': 'Email and password are required'}), 400
+
+    client = cognito_client()
+    client_id = current_app.config.get('COGNITO_APP_CLIENT_ID')
+    
+    try:
+        secret_hash = get_secret_hash(email)
+        
+        user_attrs = [{'Name': 'email', 'Value': email}]
+        # Phone removed
+
+        params = {
+            'ClientId': client_id,
+            'Username': email,
+            'Password': password,
+            'UserAttributes': user_attrs
+        }
+        
+        if secret_hash:
+            params['SecretHash'] = secret_hash
+            
+        response = client.sign_up(**params)
         
         return jsonify({
             'message': 'Registration successful',
-            'user': {
-                'id': user.id,
-                'email': user.email,
-                'phone': user.phone
-            },
-            'salon': {
-                'id': salon.id,
-                'name': salon.name
-            }
-        }), 201
+            'userSub': response.get('UserSub'),
+            'userConfirmed': response.get('UserConfirmed')
+        }), 200
         
+    except client.exceptions.UsernameExistsException:
+        return jsonify({'error': 'User already exists'}), 400
+    except client.exceptions.InvalidParameterException as e:
+         return jsonify({'error': f'Invalid Parameter: {str(e)}'}), 400
     except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)}), 400
 
-@main.route('/api/auth/login', methods=['POST'])
-def login():
-    """Login user"""
+@main.route('/api/auth/cognito-confirm', methods=['POST'])
+def cognito_confirm():
+    """
+    Proxies confirmation code to Cognito, handling SECRET_HASH.
+    """
     data = request.get_json()
-    
-    if not data.get('password'):
-        return jsonify({'error': 'Password is required'}), 400
-    
-    # Find user by email or phone
-    user = None
-    if data.get('email'):
-        user = User.query.filter_by(email=data['email']).first()
-    elif data.get('phone'):
-        user = User.query.filter_by(phone=data['phone']).first()
-    else:
-        return jsonify({'error': 'Email or phone is required'}), 400
-    
-    if not user or not verify_password(user.password_hash, data['password']):
-        return jsonify({'error': 'Invalid credentials'}), 401
-    
-    # Get user's salon
-    salon = Salon.query.filter_by(owner_id=user.id).first()
-    if not salon:
-        return jsonify({'error': 'No salon found for user'}), 404
-    
-    # Set session
-    session['user_id'] = user.id
-    session['salon_id'] = salon.id
-    
-    return jsonify({
-        'message': 'Login successful',
-        'user': {
-            'id': user.id,
-            'email': user.email,
-            'phone': user.phone
-        },
-        'salon': {
-            'id': salon.id,
-            'name': salon.name,
-            'address': salon.address
-        }
-    }), 200
+    email = data.get('email')
+    code = data.get('code')
 
-@main.route('/api/auth/logout', methods=['POST'])
-def logout():
-    """Logout user"""
-    session.clear()
-    return jsonify({'message': 'Logout successful'}), 200
+    if not email or not code:
+        return jsonify({'error': 'Email and code are required'}), 400
+
+    client = cognito_client()
+    client_id = current_app.config.get('COGNITO_APP_CLIENT_ID')
+    
+    try:
+        secret_hash = get_secret_hash(email)
+        
+        params = {
+            'ClientId': client_id,
+            'Username': email,
+            'ConfirmationCode': code,
+        }
+        
+        if secret_hash:
+            params['SecretHash'] = secret_hash
+            
+        client.confirm_sign_up(**params)
+        
+        return jsonify({'message': 'Account confirmed successfully'}), 200
+        
+    except client.exceptions.CodeMismatchException:
+        return jsonify({'error': 'Invalid verification code'}), 400
+    except client.exceptions.ExpiredCodeException:
+        return jsonify({'error': 'Verification code expired'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+
+@main.route('/api/auth/sync-profile', methods=['POST'])
+@login_required
+def sync_profile():
+    """
+    Ensures the user exists in our DB after they sign up/in via Cognito.
+    If new user, creates User and default Salon.
+    If existing, returns current data.
+    """
+    claims = g.cognito_claims
+    sub = claims.get('sub')
+    email = claims.get('email')
+    phone = claims.get('phone_number') # might be None now
+    
+    # Check if user already exists (g.current_user might be None if not found in auth.py)
+    user = User.query.filter_by(cognito_sub=sub).first()
+    
+    if not user:
+        # Create new user
+        try:
+            user = User(
+                cognito_sub=sub,
+                email=email,
+                phone=phone
+            )
+            db.session.add(user)
+            db.session.flush() # Get ID
+            
+            # Create default salon for new user
+            data = request.get_json() or {}
+            salon = Salon(
+                owner_id=user.id,
+                name=data.get('salon_name', 'My Salon'),
+                address=data.get('address', ''),
+                timezone=data.get('timezone', 'Asia/Kolkata')
+            )
+            db.session.add(salon)
+            db.session.commit()
+            
+            return jsonify({
+                'message': 'Profile created successfully',
+                'user': {'id': user.id, 'email': user.email},
+                'salon': {'id': salon.id, 'name': salon.name}
+            }), 201
+            
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'error': str(e)}), 500
+    else:
+        # User exists, return info
+        salon = Salon.query.filter_by(owner_id=user.id).first()
+        return jsonify({
+            'message': 'Profile synced',
+            'user': {'id': user.id, 'email': user.email},
+            'salon': {'id': salon.id, 'name': salon.name} if salon else None
+        }), 200
 
 @main.route('/api/auth/me', methods=['GET'])
 @login_required
 def get_current_user():
     """Get current user info"""
-    user = User.query.get(session['user_id'])
-    salon = Salon.query.get(session['salon_id'])
-    
-    if not user or not salon:
-        return jsonify({'error': 'User or salon not found'}), 404
+    if not g.current_user or not g.current_salon:
+        return jsonify({'error': 'User profile not found. Please call /sync-profile first.'}), 404
     
     return jsonify({
         'user': {
-            'id': user.id,
-            'email': user.email,
-            'phone': user.phone
+            'id': g.current_user.id,
+            'email': g.current_user.email,
+            'phone': g.current_user.phone
         },
         'salon': {
-            'id': salon.id,
-            'name': salon.name,
-            'address': salon.address,
-            'timezone': salon.timezone
+            'id': g.current_salon.id,
+            'name': g.current_salon.name,
+            'address': g.current_salon.address,
+            'timezone': g.current_salon.timezone
         }
     }), 200
 
@@ -172,7 +247,9 @@ def get_current_user():
 @login_required
 def get_services():
     """Get all active services for the salon"""
-    salon_id = session['salon_id']
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     services = Service.query.filter_by(
         salon_id=salon_id,
         is_active=True
@@ -191,8 +268,10 @@ def get_services():
 @login_required
 def create_service():
     """Create a new service"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
     data = request.get_json()
-    salon_id = session['salon_id']
+    salon_id = g.current_salon.id
     
     if not data.get('name') or not data.get('default_price'):
         return jsonify({'error': 'Name and price are required'}), 400
@@ -225,7 +304,9 @@ def create_service():
 @login_required
 def update_service(service_id):
     """Update a service"""
-    salon_id = session['salon_id']
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     service = Service.query.filter_by(id=service_id, salon_id=salon_id).first()
     
     if not service:
@@ -262,7 +343,9 @@ def update_service(service_id):
 @login_required
 def delete_service(service_id):
     """Delete (deactivate) a service"""
-    salon_id = session['salon_id']
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     service = Service.query.filter_by(id=service_id, salon_id=salon_id).first()
     
     if not service:
@@ -287,8 +370,10 @@ def delete_service(service_id):
 @login_required
 def add_service_log():
     """Add a service log entry"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
     data = request.get_json()
-    salon_id = session['salon_id']
+    salon_id = g.current_salon.id
     
     if not data.get('price') or not data.get('payment_method'):
         return jsonify({'error': 'Price and payment method are required'}), 400
@@ -327,7 +412,9 @@ def add_service_log():
 @login_required
 def get_today_logs():
     """Get today's service logs"""
-    salon_id = session['salon_id']
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     # Use UTC date to match how logs are stored (datetime.utcnow())
     today_utc = datetime.utcnow().date()
     
@@ -351,7 +438,9 @@ def get_today_logs():
 @login_required
 def get_logs():
     """Get service logs with optional date filtering"""
-    salon_id = session['salon_id']
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     
     # Get date parameters
     start_date = request.args.get('start_date')
@@ -384,26 +473,23 @@ def get_logs():
 @main.route('/api/summary/today', methods=['GET'])
 @login_required
 def get_today_summary():
-    """Get today's revenue summary - automatically resets each day at midnight UTC"""
-    salon_id = session['salon_id']
-    # Use UTC date to match how logs are stored (datetime.utcnow())
-    # This date is recalculated on each API call, so it automatically changes each day
+    """Get today's revenue summary"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     today_utc = datetime.utcnow().date()
     
-    # Get all logs for today only (using UTC date to match stored datetime)
-    # This filter ensures only today's entries are shown, and it resets automatically each day
     logs = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
         func.date(ServiceLog.served_at) == today_utc
     ).all()
     
-    # Calculate totals with proper type conversion
     total_revenue = sum(float(log.price) for log in logs)
     cash_total = sum(float(log.price) for log in logs if log.payment_method and log.payment_method.lower() == 'cash')
     upi_total = sum(float(log.price) for log in logs if log.payment_method and log.payment_method.lower() == 'upi')
     
     return jsonify({
-        'date': today_utc.isoformat(),  # Returns the date being queried
+        'date': today_utc.isoformat(),
         'total_revenue': round(total_revenue, 2),
         'cash_total': round(cash_total, 2),
         'upi_total': round(upi_total, 2),
@@ -413,14 +499,12 @@ def get_today_summary():
 @main.route('/api/summary/breakdown', methods=['GET'])
 @login_required
 def get_service_breakdown():
-    """Get service breakdown for today - automatically resets each day at midnight UTC"""
-    salon_id = session['salon_id']
-    # Use UTC date to match how logs are stored (datetime.utcnow())
-    # This date is recalculated on each API call, so it automatically changes each day
+    """Get service breakdown for today"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     today_utc = datetime.utcnow().date()
     
-    # Get service breakdown - include logs with service_id only
-    # This filter ensures only today's entries are shown, and it resets automatically each day
     breakdown = db.session.query(
         Service.name,
         func.count(ServiceLog.id).label('count'),
@@ -444,12 +528,13 @@ def get_service_breakdown():
 @login_required
 def create_daily_closing():
     """Create a daily closing entry"""
-    salon_id = session['salon_id']
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     data = request.get_json()
     
     closing_date = date.fromisoformat(data['date']) if data.get('date') else date.today()
     
-    # Check if closing already exists
     existing = DailyClosing.query.filter_by(
         salon_id=salon_id,
         date=closing_date
@@ -459,7 +544,6 @@ def create_daily_closing():
         return jsonify({'error': 'Daily closing already exists for this date'}), 400
     
     try:
-        # Calculate totals from logs
         logs = ServiceLog.query.filter(
             ServiceLog.salon_id == salon_id,
             func.date(ServiceLog.served_at) == closing_date
@@ -496,14 +580,16 @@ def create_daily_closing():
         return jsonify({'error': str(e)}), 500
 
 # ============================================
-# Staff Routes (Optional)
+# Staff Routes
 # ============================================
 
 @main.route('/api/staff', methods=['GET'])
 @login_required
 def get_staff():
     """Get all active staff members"""
-    salon_id = session['salon_id']
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    salon_id = g.current_salon.id
     staff = Staff.query.filter_by(
         salon_id=salon_id,
         is_active=True
@@ -522,8 +608,10 @@ def get_staff():
 @login_required
 def create_staff():
     """Create a new staff member"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
     data = request.get_json()
-    salon_id = session['salon_id']
+    salon_id = g.current_salon.id
     
     if not data.get('name'):
         return jsonify({'error': 'Name is required'}), 400

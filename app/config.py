@@ -21,6 +21,12 @@ class Config:
     # CORS Configuration
     FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
     
+    # AWS Cognito Configuration
+    COGNITO_USER_POOL_ID = os.environ.get('COGNITO_USER_POOL_ID')
+    COGNITO_APP_CLIENT_ID = os.environ.get('COGNITO_APP_CLIENT_ID')
+    COGNITO_CLIENT_SECRET = os.environ.get('COGNITO_CLIENT_SECRET')
+    COGNITO_REGION = os.environ.get('COGNITO_REGION', 'us-east-1')
+    
     # Session Configuration
     SESSION_TYPE = 'filesystem'
     SESSION_PERMANENT = True

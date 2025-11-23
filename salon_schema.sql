@@ -6,9 +6,9 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- Users table
 CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  cognito_sub VARCHAR(255) UNIQUE,
   phone VARCHAR(20) UNIQUE,
   email VARCHAR(255) UNIQUE,
-  password_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
