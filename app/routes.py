@@ -716,12 +716,24 @@ def get_monthly_analytics():
         ServiceLog.served_at <= end_utc
     ).all()
     
+    # Aggregate by day & calculate extra metrics
     daily_data = {}
+    service_counts = {}
+    staff_rev = {}
+    
     for log in logs:
-        # Convert to local time to determine the day
+        # 1. Daily Trend
         local_time = log.served_at.replace(tzinfo=pytz.utc).astimezone(tz)
         day = local_time.day
         daily_data[day] = daily_data.get(day, 0) + float(log.price)
+        
+        # 2. Service Mix
+        svc_name = log.service.name if log.service else (log.custom_service or 'Unknown')
+        service_counts[svc_name] = service_counts.get(svc_name, 0) + 1
+        
+        # 3. Staff Share
+        s_name = log.staff.name if log.staff else 'Unassigned'
+        staff_rev[s_name] = staff_rev.get(s_name, 0) + float(log.price)
         
     import calendar
     _, num_days = calendar.monthrange(year, month)
@@ -733,7 +745,27 @@ def get_monthly_analytics():
         chart_data.append({'name': str(d), 'value': round(val, 2)})
         total_revenue += val
         
-    return jsonify({'data': chart_data, 'total': round(total_revenue, 2)}), 200
+    total_services = len(logs)
+    atv = round(total_revenue / total_services, 2) if total_services > 0 else 0
+    
+    service_mix = sorted(
+        [{'name': k, 'value': v} for k, v in service_counts.items()],
+        key=lambda x: x['value'], reverse=True
+    )[:5]
+    
+    staff_contribution = sorted(
+        [{'name': k, 'value': round(v, 2)} for k, v in staff_rev.items()],
+        key=lambda x: x['value'], reverse=True
+    )
+        
+    return jsonify({
+        'data': chart_data, 
+        'total': round(total_revenue, 2),
+        'total_services': total_services,
+        'average_ticket': atv,
+        'service_mix': service_mix,
+        'staff_contribution': staff_contribution
+    }), 200
 
 @main.route('/api/analytics/yearly', methods=['GET'])
 @login_required
@@ -766,10 +798,21 @@ def get_yearly_analytics():
     ).all()
     
     monthly_data = {}
+    service_counts = {}
+    staff_rev = {}
+    
     for log in logs:
         local_time = log.served_at.replace(tzinfo=pytz.utc).astimezone(tz)
         m = local_time.month
         monthly_data[m] = monthly_data.get(m, 0) + float(log.price)
+        
+        # Service Mix
+        svc_name = log.service.name if log.service else (log.custom_service or 'Unknown')
+        service_counts[svc_name] = service_counts.get(svc_name, 0) + 1
+        
+        # Staff Share
+        s_name = log.staff.name if log.staff else 'Unassigned'
+        staff_rev[s_name] = staff_rev.get(s_name, 0) + float(log.price)
         
     chart_data = []
     month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -780,7 +823,27 @@ def get_yearly_analytics():
         chart_data.append({'name': month_names[i-1], 'value': round(val, 2)})
         total_revenue += val
         
-    return jsonify({'data': chart_data, 'total': round(total_revenue, 2)}), 200
+    total_services = len(logs)
+    atv = round(total_revenue / total_services, 2) if total_services > 0 else 0
+    
+    service_mix = sorted(
+        [{'name': k, 'value': v} for k, v in service_counts.items()],
+        key=lambda x: x['value'], reverse=True
+    )[:5]
+    
+    staff_contribution = sorted(
+        [{'name': k, 'value': round(v, 2)} for k, v in staff_rev.items()],
+        key=lambda x: x['value'], reverse=True
+    )
+        
+    return jsonify({
+        'data': chart_data, 
+        'total': round(total_revenue, 2),
+        'total_services': total_services,
+        'average_ticket': atv,
+        'service_mix': service_mix,
+        'staff_contribution': staff_contribution
+    }), 200
 
 @main.route('/api/daily-closing', methods=['POST'])
 @login_required
