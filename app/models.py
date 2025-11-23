@@ -12,6 +12,7 @@ class User(db.Model):
     cognito_sub = db.Column(db.String(255), unique=True, nullable=True)
     phone = db.Column(db.String(20), unique=True, nullable=True)
     email = db.Column(db.String(255), unique=True, nullable=True)
+    role = db.Column(db.String(20), default='OWNER', nullable=False) # 'OWNER', 'STAFF', 'ADMIN'
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     salons = db.relationship('Salon', backref='owner', lazy=True)
@@ -36,9 +37,11 @@ class Staff(db.Model):
 
     id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
     salon_id = db.Column(db.String(36), db.ForeignKey('salons.id'), nullable=False)
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=True) # Link to User login
     name = db.Column(db.String(255), nullable=False)
+    email = db.Column(db.String(255), nullable=True) # For invitation matching
     phone = db.Column(db.String(20))
-    role = db.Column(db.String(50))
+    role = db.Column(db.String(50)) # Internal role title e.g. "Senior Stylist"
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 

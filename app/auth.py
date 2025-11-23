@@ -5,7 +5,7 @@ from functools import wraps
 from flask import request, jsonify, g, current_app
 from jose import jwk, jwt
 from jose.utils import base64url_decode
-from app.models import User, Salon
+from app.models import User, Salon, Staff
 
 def get_token_auth_header():
     """Obtains the Access Token from the Authorization Header"""
@@ -24,30 +24,35 @@ def get_token_auth_header():
 
     return parts[1]
 
+_COGNITO_KEYS = None
+
 def verify_cognito_token(token):
     """
     Verifies the Cognito JWT token.
     Returns the claims if valid, raises Exception if invalid.
     """
+    global _COGNITO_KEYS
+    
     # Get Cognito details from config
     region = current_app.config.get('COGNITO_REGION')
     user_pool_id = current_app.config.get('COGNITO_USER_POOL_ID')
     app_client_id = current_app.config.get('COGNITO_APP_CLIENT_ID')
 
     if not region or not user_pool_id:
-        # Fallback for dev/testing if keys aren't set yet
-        # WARNING: This is insecure and should only be used if explicitly allowed in dev
         if current_app.config.get('ENV') == 'development' and not region:
             return {"sub": "dev-user", "email": "dev@example.com"}
         raise Exception("Cognito configuration missing")
 
-    keys_url = f'https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json'
+    # Fetch keys only if not cached
+    if not _COGNITO_KEYS:
+        keys_url = f'https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json'
+        try:
+            with urllib.request.urlopen(keys_url) as response:
+                _COGNITO_KEYS = json.loads(response.read())['keys']
+        except Exception as e:
+            raise Exception(f"Could not fetch JWKS: {str(e)}")
     
-    try:
-        with urllib.request.urlopen(keys_url) as response:
-            keys = json.loads(response.read())['keys']
-    except Exception as e:
-        raise Exception(f"Could not fetch JWKS: {str(e)}")
+    keys = _COGNITO_KEYS
 
     # Get the kid from the headers
     headers = jwt.get_unverified_headers(token)
@@ -121,8 +126,15 @@ def login_required(f):
             
             if user:
                 g.current_user = user
-                # Also load their salon for convenience
-                salon = Salon.query.filter_by(owner_id=user.id).first()
+                
+                # Load Salon based on Role
+                if user.role == 'STAFF':
+                    staff_record = Staff.query.filter_by(user_id=user.id).first()
+                    # Access the salon relationship from Staff model if it exists
+                    salon = staff_record.salon if staff_record else None
+                else:
+                    salon = Salon.query.filter_by(owner_id=user.id).first()
+                    
                 g.current_salon = salon
             else:
                 g.current_user = None

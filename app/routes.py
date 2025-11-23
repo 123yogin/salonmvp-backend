@@ -167,42 +167,54 @@ def cognito_confirm():
 def sync_profile():
     """
     Ensures the user exists in our DB after they sign up/in via Cognito.
-    If new user, creates User and default Salon.
-    If existing, returns current data.
+    Handles automatic linking of invited Staff members.
     """
     claims = g.cognito_claims
     sub = claims.get('sub')
     email = claims.get('email')
-    phone = claims.get('phone_number') # might be None now
+    phone = claims.get('phone_number') # might be None
     
-    # Check if user already exists (g.current_user might be None if not found in auth.py)
+    # Check if user already exists
     user = User.query.filter_by(cognito_sub=sub).first()
     
     if not user:
         # Create new user
         try:
+            # Determine Role: Check if this email was invited as Staff
+            invited_staff = Staff.query.filter_by(email=email).first()
+            
+            role = 'STAFF' if invited_staff else 'OWNER'
+            
             user = User(
                 cognito_sub=sub,
                 email=email,
-                phone=phone
+                phone=phone,
+                role=role
             )
             db.session.add(user)
             db.session.flush() # Get ID
             
-            # Create default salon for new user
-            data = request.get_json() or {}
-            salon = Salon(
-                owner_id=user.id,
-                name=data.get('salon_name', 'My Salon'),
-                address=data.get('address', ''),
-                timezone=data.get('timezone', 'Asia/Kolkata')
-            )
-            db.session.add(salon)
+            if role == 'STAFF':
+                # Link to existing staff record
+                invited_staff.user_id = user.id
+                # Staff uses the existing salon, doesn't create one
+                salon = invited_staff.salon
+            else:
+                # Create default salon for new OWNER
+                data = request.get_json() or {}
+                salon = Salon(
+                    owner_id=user.id,
+                    name=data.get('salon_name', 'My Salon'),
+                    address=data.get('address', ''),
+                    timezone=data.get('timezone', 'Asia/Kolkata')
+                )
+                db.session.add(salon)
+            
             db.session.commit()
             
             return jsonify({
                 'message': 'Profile created successfully',
-                'user': {'id': user.id, 'email': user.email},
+                'user': {'id': user.id, 'email': user.email, 'role': user.role},
                 'salon': {'id': salon.id, 'name': salon.name}
             }), 201
             
@@ -210,11 +222,18 @@ def sync_profile():
             db.session.rollback()
             return jsonify({'error': str(e)}), 500
     else:
-        # User exists, return info
-        salon = Salon.query.filter_by(owner_id=user.id).first()
+        # User exists
+        if user.role == 'STAFF':
+            # Find their salon via Staff table
+            staff_record = Staff.query.filter_by(user_id=user.id).first()
+            salon = staff_record.salon if staff_record else None
+        else:
+            # Owner finds salon via Owner ID
+            salon = Salon.query.filter_by(owner_id=user.id).first()
+            
         return jsonify({
             'message': 'Profile synced',
-            'user': {'id': user.id, 'email': user.email},
+            'user': {'id': user.id, 'email': user.email, 'role': user.role},
             'salon': {'id': salon.id, 'name': salon.name} if salon else None
         }), 200
 
@@ -222,20 +241,40 @@ def sync_profile():
 @login_required
 def get_current_user():
     """Get current user info"""
-    if not g.current_user or not g.current_salon:
+    if not g.current_user:
         return jsonify({'error': 'User profile not found. Please call /sync-profile first.'}), 404
+        
+    user = g.current_user
+    
+    # Determine Salon based on Role
+    if user.role == 'STAFF':
+        staff_record = Staff.query.filter_by(user_id=user.id).first()
+        salon = staff_record.salon if staff_record else None
+        # Also verify the staff record is active?
+        if not staff_record or not staff_record.is_active:
+             return jsonify({'error': 'Staff account is inactive'}), 403
+    else:
+        # Owner
+        salon = Salon.query.filter_by(owner_id=user.id).first()
+    
+    if not salon:
+         return jsonify({'error': 'No salon found linked to this user'}), 404
+    
+    # Set global context for subsequent decorators if any (though auth.py does this too, but simple)
+    # Actually auth.py logic for g.current_salon needs update too if we rely on it!
     
     return jsonify({
         'user': {
-            'id': g.current_user.id,
-            'email': g.current_user.email,
-            'phone': g.current_user.phone
+            'id': user.id,
+            'email': user.email,
+            'phone': user.phone,
+            'role': user.role
         },
         'salon': {
-            'id': g.current_salon.id,
-            'name': g.current_salon.name,
-            'address': g.current_salon.address,
-            'timezone': g.current_salon.timezone
+            'id': salon.id,
+            'name': salon.name,
+            'address': salon.address,
+            'timezone': salon.timezone
         }
     }), 200
 
@@ -418,10 +457,18 @@ def get_today_logs():
     # Use UTC date to match how logs are stored (datetime.utcnow())
     today_utc = datetime.utcnow().date()
     
-    logs = ServiceLog.query.filter(
+    query = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
         func.date(ServiceLog.served_at) == today_utc
-    ).order_by(ServiceLog.served_at.desc()).all()
+    )
+
+    # If Staff, filter by their ID so they only see THEIR logs
+    if g.current_user.role == 'STAFF':
+        staff_record = Staff.query.filter_by(user_id=g.current_user.id).first()
+        if staff_record:
+            query = query.filter(ServiceLog.staff_id == staff_record.id)
+    
+    logs = query.order_by(ServiceLog.served_at.desc()).all()
     
     return jsonify({
         'logs': [{
@@ -479,10 +526,18 @@ def get_today_summary():
     salon_id = g.current_salon.id
     today_utc = datetime.utcnow().date()
     
-    logs = ServiceLog.query.filter(
+    query = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
         func.date(ServiceLog.served_at) == today_utc
-    ).all()
+    )
+
+    # If Staff, filter by their ID so they only see THEIR revenue
+    if g.current_user.role == 'STAFF':
+        staff_record = Staff.query.filter_by(user_id=g.current_user.id).first()
+        if staff_record:
+            query = query.filter(ServiceLog.staff_id == staff_record.id)
+
+    logs = query.all()
     
     total_revenue = sum(float(log.price) for log in logs)
     cash_total = sum(float(log.price) for log in logs if log.payment_method and log.payment_method.lower() == 'cash')
@@ -522,6 +577,41 @@ def get_service_breakdown():
             'count': item[1],
             'total': round(float(item[2]) if item[2] else 0, 2)
         } for item in breakdown]
+    }), 200
+
+@main.route('/api/summary/staff-performance', methods=['GET'])
+@login_required
+def get_staff_performance():
+    """Get sales performance by staff for today"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    # Only OWNER can see this report
+    if g.current_user.role != 'OWNER':
+         return jsonify({'error': 'Unauthorized'}), 403
+         
+    salon_id = g.current_salon.id
+    today_utc = datetime.utcnow().date()
+    
+    # Query: Group by staff_id, Sum Price
+    # Note: This only includes logs linked to a staff member.
+    # Logs with staff_id=None (if any) won't appear here.
+    results = db.session.query(
+        Staff.name,
+        func.count(ServiceLog.id).label('count'),
+        func.sum(ServiceLog.price).label('total')
+    ).join(
+        ServiceLog, ServiceLog.staff_id == Staff.id
+    ).filter(
+        ServiceLog.salon_id == salon_id,
+        func.date(ServiceLog.served_at) == today_utc
+    ).group_by(Staff.name).all()
+    
+    return jsonify({
+        'performance': [{
+            'staff_name': item[0],
+            'count': item[1],
+            'total': round(float(item[2]) if item[2] else 0, 2)
+        } for item in results]
     }), 200
 
 @main.route('/api/daily-closing', methods=['POST'])
@@ -599,16 +689,22 @@ def get_staff():
         'staff': [{
             'id': s.id,
             'name': s.name,
+            'email': s.email, # Include email
             'phone': s.phone,
-            'role': s.role
+            'role': s.role,
+            'user_id': s.user_id # See if they are linked
         } for s in staff]
     }), 200
 
 @main.route('/api/staff', methods=['POST'])
 @login_required
 def create_staff():
-    """Create a new staff member"""
+    """Create a new staff member (Invite)"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    # Only OWNER can add staff
+    if g.current_user.role != 'OWNER':
+         return jsonify({'error': 'Only salon owners can manage staff'}), 403
     
     data = request.get_json()
     salon_id = g.current_salon.id
@@ -616,25 +712,66 @@ def create_staff():
     if not data.get('name'):
         return jsonify({'error': 'Name is required'}), 400
     
+    email = data.get('email')
+    if not email:
+         return jsonify({'error': 'Email is required for invitation'}), 400
+    
+    # Check if staff email already exists in this salon
+    existing = Staff.query.filter_by(salon_id=salon_id, email=email, is_active=True).first()
+    if existing:
+         return jsonify({'error': 'Staff with this email already exists'}), 400
+    
     try:
         staff = Staff(
             salon_id=salon_id,
             name=data['name'],
+            email=email,
             phone=data.get('phone'),
-            role=data.get('role')
+            role=data.get('role', 'Stylist')
         )
         db.session.add(staff)
         db.session.commit()
         
         return jsonify({
-            'message': 'Staff member created successfully',
+            'message': 'Staff invited successfully. They can now log in with this email.',
             'staff': {
                 'id': staff.id,
                 'name': staff.name,
+                'email': staff.email,
                 'phone': staff.phone,
                 'role': staff.role
             }
         }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@main.route('/api/staff/<staff_id>', methods=['DELETE'])
+@login_required
+def delete_staff(staff_id):
+    """Deactivate a staff member"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    # Only OWNER can delete staff
+    if g.current_user.role != 'OWNER':
+         return jsonify({'error': 'Only salon owners can manage staff'}), 403
+    
+    salon_id = g.current_salon.id
+    staff = Staff.query.filter_by(id=staff_id, salon_id=salon_id).first()
+    
+    if not staff:
+        return jsonify({'error': 'Staff member not found'}), 404
+    
+    try:
+        staff.is_active = False
+        # Optionally, if they have a linked user_id, we might want to unlink it or block that user?
+        # For now, just removing from salon visibility is enough. 
+        # If they login, sync_profile checks is_active via "find salon via Staff table" logic?
+        # Wait, sync_profile links them. get_current_user checks if staff is active!
+        
+        db.session.commit()
+        return jsonify({'message': 'Staff deactivated successfully'}), 200
         
     except Exception as e:
         db.session.rollback()
