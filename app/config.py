@@ -11,8 +11,18 @@ class Config:
     DEBUG = os.environ.get('FLASK_DEBUG', 'True').lower() in ('true', '1', 't')
     
     # Database Configuration
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///salon.db'
+    uri = os.environ.get('DATABASE_URL')
+    if uri and uri.startswith("postgres://"):
+        uri = uri.replace("postgres://", "postgresql://", 1)
+    
+    SQLALCHEMY_DATABASE_URI = uri or 'sqlite:///salon.db'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    
+    # Database connection pooling options
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+    }
     
     # Server Configuration
     HOST = os.environ.get('FLASK_HOST', '127.0.0.1')
