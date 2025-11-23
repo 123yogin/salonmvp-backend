@@ -25,17 +25,19 @@ def health():
 # Helper Functions
 # ============================================
 
-def get_today_range_utc(salon):
+def get_day_range_utc(salon, target_date=None):
     """
-    Calculates the start and end datetime in UTC for the current day 
-    in the salon's local timezone.
+    Calculates the start and end datetime in UTC for a specific date 
+    in the salon's local timezone. Defaults to today if no date provided.
+    target_date: datetime.date object
     """
     tz = pytz.timezone(salon.timezone)
-    now_local = datetime.now(tz)
-    today_local = now_local.date()
     
-    start_local = tz.localize(datetime.combine(today_local, datetime.min.time()))
-    end_local = tz.localize(datetime.combine(today_local, datetime.max.time()))
+    if not target_date:
+        target_date = datetime.now(tz).date()
+    
+    start_local = tz.localize(datetime.combine(target_date, datetime.min.time()))
+    end_local = tz.localize(datetime.combine(target_date, datetime.max.time()))
     
     return start_local.astimezone(pytz.utc), end_local.astimezone(pytz.utc)
 
@@ -469,11 +471,23 @@ def add_service_log():
 @main.route('/api/logs/today', methods=['GET'])
 @login_required
 def get_today_logs():
-    """Get today's service logs (Timezone Aware)"""
+    """Get service logs for today (or specific date)"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
     
     salon_id = g.current_salon.id
-    start_utc, end_utc = get_today_range_utc(g.current_salon)
+    
+    # Parse date param (optional, defaults to today if not provided)
+    date_str = request.args.get('date')
+    target_date = None
+    if date_str:
+        try:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            # If invalid date, just ignore and use today, or return error. 
+            # Let's return error to be consistent
+            return jsonify({'error': 'Invalid date format'}), 400
+
+    start_utc, end_utc = get_day_range_utc(g.current_salon, target_date)
     
     query = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
@@ -536,25 +550,31 @@ def get_logs():
 # Summary & Analytics Routes
 # ============================================
 
-@main.route('/api/summary/today', methods=['GET'])
+@main.route('/api/summary', methods=['GET'])
 @login_required
-def get_today_summary():
-    """Get today's revenue summary (Timezone Aware)"""
+def get_summary():
+    """Get revenue summary for a specific date (or today)"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
     
     salon_id = g.current_salon.id
-    start_utc, end_utc = get_today_range_utc(g.current_salon)
     
-    # Return local date for display
-    tz = pytz.timezone(g.current_salon.timezone)
-    today_str = datetime.now(tz).date().isoformat()
+    # Parse date param
+    date_str = request.args.get('date')
+    target_date = None
+    if date_str:
+        try:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+            
+    start_utc, end_utc = get_day_range_utc(g.current_salon, target_date)
     
     query = ServiceLog.query.filter(
         ServiceLog.salon_id == salon_id,
         ServiceLog.served_at >= start_utc,
         ServiceLog.served_at <= end_utc
     )
-    
+
     # If Staff, filter by their ID so they only see THEIR revenue
     if g.current_user.role == 'STAFF':
         staff_record = Staff.query.filter_by(user_id=g.current_user.id).first()
@@ -568,7 +588,7 @@ def get_today_summary():
     upi_total = sum(float(log.price) for log in logs if log.payment_method and log.payment_method.lower() == 'upi')
     
     return jsonify({
-        'date': today_str,
+        'date': target_date.isoformat() if target_date else datetime.now(pytz.timezone(g.current_salon.timezone)).date().isoformat(),
         'total_revenue': round(total_revenue, 2),
         'cash_total': round(cash_total, 2),
         'upi_total': round(upi_total, 2),
@@ -578,11 +598,21 @@ def get_today_summary():
 @main.route('/api/summary/breakdown', methods=['GET'])
 @login_required
 def get_service_breakdown():
-    """Get service breakdown for today (Timezone Aware)"""
+    """Get service breakdown for a date"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
     
     salon_id = g.current_salon.id
-    start_utc, end_utc = get_today_range_utc(g.current_salon)
+    
+    # Parse date param
+    date_str = request.args.get('date')
+    target_date = None
+    if date_str:
+        try:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return jsonify({'error': 'Invalid date format'}), 400
+            
+    start_utc, end_utc = get_day_range_utc(g.current_salon, target_date)
     
     breakdown = db.session.query(
         Service.name,
@@ -607,7 +637,7 @@ def get_service_breakdown():
 @main.route('/api/summary/staff-performance', methods=['GET'])
 @login_required
 def get_staff_performance():
-    """Get sales performance by staff for today (Timezone Aware)"""
+    """Get sales performance by staff for a date"""
     if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
     
     # Only OWNER can see this report
@@ -615,11 +645,19 @@ def get_staff_performance():
          return jsonify({'error': 'Unauthorized'}), 403
          
     salon_id = g.current_salon.id
-    start_utc, end_utc = get_today_range_utc(g.current_salon)
+    
+    # Parse date param
+    date_str = request.args.get('date')
+    target_date = None
+    if date_str:
+        try:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return jsonify({'error': 'Invalid date format'}), 400
+            
+    start_utc, end_utc = get_day_range_utc(g.current_salon, target_date)
     
     # Query: Group by staff_id, Sum Price
-    # Note: This only includes logs linked to a staff member.
-    # Logs with staff_id=None (if any) won't appear here.
     results = db.session.query(
         Staff.name,
         func.count(ServiceLog.id).label('count'),
@@ -639,6 +677,110 @@ def get_staff_performance():
             'total': round(float(item[2]) if item[2] else 0, 2)
         } for item in results]
     }), 200
+
+@main.route('/api/analytics/monthly', methods=['GET'])
+@login_required
+def get_monthly_analytics():
+    """Get daily revenue for a specific month"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    if g.current_user.role != 'OWNER':
+         return jsonify({'error': 'Unauthorized'}), 403
+
+    salon_id = g.current_salon.id
+    tz = pytz.timezone(g.current_salon.timezone)
+    now = datetime.now(tz)
+    
+    try:
+        month = request.args.get('month', type=int, default=now.month)
+        year = request.args.get('year', type=int, default=now.year)
+    except ValueError:
+        return jsonify({'error': 'Invalid month/year'}), 400
+    
+    # Calculate range
+    start_local = tz.localize(datetime(year, month, 1, 0, 0, 0))
+    
+    if month == 12:
+        next_month_start = datetime(year + 1, 1, 1, 0, 0, 0)
+    else:
+        next_month_start = datetime(year, month + 1, 1, 0, 0, 0)
+    
+    end_local = tz.localize(next_month_start - timedelta(seconds=1))
+    
+    start_utc = start_local.astimezone(pytz.utc)
+    end_utc = end_local.astimezone(pytz.utc)
+    
+    logs = ServiceLog.query.filter(
+        ServiceLog.salon_id == salon_id,
+        ServiceLog.served_at >= start_utc,
+        ServiceLog.served_at <= end_utc
+    ).all()
+    
+    daily_data = {}
+    for log in logs:
+        # Convert to local time to determine the day
+        local_time = log.served_at.replace(tzinfo=pytz.utc).astimezone(tz)
+        day = local_time.day
+        daily_data[day] = daily_data.get(day, 0) + float(log.price)
+        
+    import calendar
+    _, num_days = calendar.monthrange(year, month)
+    
+    chart_data = []
+    total_revenue = 0
+    for d in range(1, num_days + 1):
+        val = daily_data.get(d, 0)
+        chart_data.append({'name': str(d), 'value': round(val, 2)})
+        total_revenue += val
+        
+    return jsonify({'data': chart_data, 'total': round(total_revenue, 2)}), 200
+
+@main.route('/api/analytics/yearly', methods=['GET'])
+@login_required
+def get_yearly_analytics():
+    """Get monthly revenue for a specific year"""
+    if not g.current_salon: return jsonify({'error': 'No salon found'}), 404
+    
+    if g.current_user.role != 'OWNER':
+         return jsonify({'error': 'Unauthorized'}), 403
+
+    salon_id = g.current_salon.id
+    tz = pytz.timezone(g.current_salon.timezone)
+    now = datetime.now(tz)
+    
+    try:
+        year = request.args.get('year', type=int, default=now.year)
+    except ValueError:
+        return jsonify({'error': 'Invalid year'}), 400
+        
+    start_local = tz.localize(datetime(year, 1, 1, 0, 0, 0))
+    end_local = tz.localize(datetime(year, 12, 31, 23, 59, 59))
+    
+    start_utc = start_local.astimezone(pytz.utc)
+    end_utc = end_local.astimezone(pytz.utc)
+    
+    logs = ServiceLog.query.filter(
+        ServiceLog.salon_id == salon_id,
+        ServiceLog.served_at >= start_utc,
+        ServiceLog.served_at <= end_utc
+    ).all()
+    
+    monthly_data = {}
+    for log in logs:
+        local_time = log.served_at.replace(tzinfo=pytz.utc).astimezone(tz)
+        m = local_time.month
+        monthly_data[m] = monthly_data.get(m, 0) + float(log.price)
+        
+    chart_data = []
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    total_revenue = 0
+    
+    for i in range(1, 13):
+        val = monthly_data.get(i, 0)
+        chart_data.append({'name': month_names[i-1], 'value': round(val, 2)})
+        total_revenue += val
+        
+    return jsonify({'data': chart_data, 'total': round(total_revenue, 2)}), 200
 
 @main.route('/api/daily-closing', methods=['POST'])
 @login_required
